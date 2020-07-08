@@ -50,17 +50,26 @@ use polkadot_node_primitives::{
 };
 use polkadot_subsystem::{
 	FromOverseer, OverseerSignal, Subsystem, SubsystemContext, SpawnedSubsystem,
+	util::{
+		self,
+		request_global_validation_schedule,
+		request_head_data,
+		request_local_validation_data,
+		request_signing_context,
+		request_validator_groups,
+		request_validators,
+	},
 };
 use polkadot_subsystem::messages::{
-	AllMessages, CandidateBackingMessage, CandidateSelectionMessage, SchedulerRoster,
-	RuntimeApiMessage, RuntimeApiRequest, CandidateValidationMessage, ValidationFailed,
+	AllMessages, CandidateBackingMessage, CandidateSelectionMessage,
+	RuntimeApiMessage, CandidateValidationMessage, ValidationFailed,
 	StatementDistributionMessage, NewBackedCandidate, ProvisionerMessage, ProvisionableData,
 	PoVDistributionMessage, AvailabilityStoreMessage,
 };
 use statement_table::{
 	generic::AttestedCandidate as TableAttestedCandidate,
 	Table, Context as TableContextTrait, Statement as TableStatement,
-	SignedStatement as TableSignedStatement, Summary as TableSummary, 
+	SignedStatement as TableSignedStatement, Summary as TableSummary,
 };
 
 #[derive(Debug, derive_more::From)]
@@ -80,6 +89,8 @@ enum Error {
 	Mpsc(mpsc::SendError),
 	#[from]
 	Spawn(SpawnError),
+	#[from]
+	UtilError(util::Error),
 }
 
 /// Holds all data needed for candidate backing job operation.
@@ -179,6 +190,23 @@ impl From<FromJob> for AllMessages {
 			FromJob::StatementDistribution(msg) => AllMessages::StatementDistribution(msg),
 			FromJob::PoVDistribution(msg) => AllMessages::PoVDistribution(msg),
 			FromJob::Provisioner(msg) => AllMessages::Provisioner(msg),
+		}
+	}
+}
+
+impl TryFrom<AllMessages> for FromJob {
+	type Error = &'static str;
+
+	fn try_from(f: AllMessages) -> Result<Self, Self::Error> {
+		match f {
+			AllMessages::AvailabilityStore(msg) => Ok(FromJob::AvailabilityStore(msg)),
+			AllMessages::RuntimeApi(msg) => Ok(FromJob::RuntimeApiMessage(msg)),
+			AllMessages::CandidateValidation(msg) => Ok(FromJob::CandidateValidation(msg)),
+			AllMessages::CandidateSelection(msg) => Ok(FromJob::CandidateSelection(msg)),
+			AllMessages::StatementDistribution(msg) => Ok(FromJob::StatementDistribution(msg)),
+			AllMessages::PoVDistribution(msg) => Ok(FromJob::PoVDistribution(msg)),
+			AllMessages::Provisioner(msg) => Ok(FromJob::Provisioner(msg)),
+			_ => Err("can't convert this AllMessages variant to FromJob"),
 		}
 	}
 }
@@ -666,104 +694,6 @@ async fn run_job(
 	job.run().await
 }
 
-/// Request a `GlobalValidationSchedule` from `RuntimeApi`.
-async fn request_global_validation_schedule(
-	parent: Hash,
-	s: &mut mpsc::Sender<FromJob>,
-) -> Result<oneshot::Receiver<GlobalValidationSchedule>, Error> {
-	let (tx, rx) = oneshot::channel();
-
-	s.send(FromJob::RuntimeApiMessage(RuntimeApiMessage::Request(
-				parent,
-				RuntimeApiRequest::GlobalValidationSchedule(tx),
-			)
-	)).await?;
-
-	Ok(rx)
-}
-
-/// Request a `LocalValidationData` from `RuntimeApi`.
-async fn request_local_validation_data(
-	parent: Hash,
-	para_id: ParaId,
-	s: &mut mpsc::Sender<FromJob>,
-) -> Result<oneshot::Receiver<Option<LocalValidationData>>, Error> {
-	let (tx, rx) = oneshot::channel();
-
-	s.send(FromJob::RuntimeApiMessage(RuntimeApiMessage::Request(
-				parent,
-				RuntimeApiRequest::LocalValidationData(para_id, tx),
-			)
-	)).await?;
-
-	Ok(rx)
-}
-
-/// Request a validator set from the `RuntimeApi`.
-async fn request_validators(
-	parent: Hash,
-	s: &mut mpsc::Sender<FromJob>,
-) -> Result<oneshot::Receiver<Vec<ValidatorId>>, Error> {
-	let (tx, rx) = oneshot::channel();
-
-	s.send(FromJob::RuntimeApiMessage(RuntimeApiMessage::Request(
-			parent,
-			RuntimeApiRequest::Validators(tx),
-		)
-	)).await?;
-
-	Ok(rx)
-}
-
-/// Request the scheduler roster from `RuntimeApi`.
-async fn request_validator_groups(
-	parent: Hash,
-	s: &mut mpsc::Sender<FromJob>,
-) -> Result<oneshot::Receiver<SchedulerRoster>, Error> {
-	let (tx, rx) = oneshot::channel();
-
-	s.send(FromJob::RuntimeApiMessage(RuntimeApiMessage::Request(
-			parent,
-			RuntimeApiRequest::ValidatorGroups(tx),
-		)
-	)).await?;
-
-	Ok(rx)
-}
-
-/// Request a `SigningContext` from the `RuntimeApi`.
-async fn request_signing_context(
-	parent: Hash,
-	s: &mut mpsc::Sender<FromJob>,
-) -> Result<oneshot::Receiver<SigningContext>, Error> {
-	let (tx, rx) = oneshot::channel();
-
-	s.send(FromJob::RuntimeApiMessage(RuntimeApiMessage::Request(
-			parent,
-			RuntimeApiRequest::SigningContext(tx),
-		)
-	)).await?;
-
-	Ok(rx)
-}
-
-/// Request `HeadData` for some `ParaId` from `RuntimeApi`.
-async fn request_head_data(
-	parent: Hash,
-	s: &mut mpsc::Sender<FromJob>,
-	id: ParaId,
-) -> Result<oneshot::Receiver<HeadData>, Error> {
-	let (tx, rx) = oneshot::channel();
-
-	s.send(FromJob::RuntimeApiMessage(RuntimeApiMessage::Request(
-			parent,
-			RuntimeApiRequest::HeadData(id, tx),
-		)
-	)).await?;
-
-	Ok(rx)
-}
-
 impl<S: Spawn> Jobs<S> {
 	fn new(spawner: S) -> Self {
 		Self {
@@ -1163,9 +1093,9 @@ mod tests {
 		let test_state = TestState::default();
 		test_harness(test_state.keystore.clone(), |test_harness| async move {
 			let TestHarness { mut virtual_overseer } = test_harness;
-			
+
 			test_startup(&mut virtual_overseer, &test_state).await;
-	
+
 			let pov_block = PoVBlock {
 				block_data: BlockData(vec![42, 43, 44]),
 			};
