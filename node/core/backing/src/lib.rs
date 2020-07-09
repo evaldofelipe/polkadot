@@ -991,16 +991,6 @@ mod tests {
 			}
 		);
 
-		// Check that subsystem job issues a request for the head data.
-		assert_matches!(
-			virtual_overseer.recv().await,
-			AllMessages::RuntimeApi(
-				RuntimeApiMessage::Request(parent, RuntimeApiRequest::HeadData(id, tx))
-			) if parent == test_state.relay_parent => {
-				tx.send(test_state.head_data.get(&id).unwrap().clone()).unwrap();
-			}
-		);
-
 		// Check that subsystem job issues a request for the signing context.
 		assert_matches!(
 			virtual_overseer.recv().await,
@@ -1008,6 +998,16 @@ mod tests {
 				RuntimeApiMessage::Request(parent, RuntimeApiRequest::SigningContext(tx))
 			) if parent == test_state.relay_parent => {
 				tx.send(test_state.signing_context.clone()).unwrap();
+			}
+		);
+
+		// Check that subsystem job issues a request for the head data.
+		assert_matches!(
+			virtual_overseer.recv().await,
+			AllMessages::RuntimeApi(
+				RuntimeApiMessage::Request(parent, RuntimeApiRequest::HeadData(id, tx))
+			) if parent == test_state.relay_parent => {
+				tx.send(test_state.head_data.get(&id).unwrap().clone()).unwrap();
 			}
 		);
 	}
