@@ -21,6 +21,7 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bitvec::vec::BitVec;
@@ -233,7 +234,7 @@ impl CandidateBackingJob {
 	async fn validate_and_second(
 		&mut self,
 		candidate: AbridgedCandidateReceipt,
-		pov: PoVBlock,
+		pov: Arc<PoVBlock>,
 	) -> Result<ValidationResult, Error> {
 		let (valid, global_validation_schedule, local_validation_data) = self.request_candidate_validation(candidate.clone(), pov.clone()).await?;
 		let statement = match valid {
@@ -260,9 +261,8 @@ impl CandidateBackingJob {
 		Ok(valid)
 	}
 
-	fn get_backed(&self) -> Vec<NewBackedCandidate> {
+	async fn get_backed(&self, mut tx: mpsc::Sender<NewBackedCandidate>) -> Result<(), Error> {
 		let proposed = self.table.proposed_candidates(&self.table_context);
-		let mut res = Vec::with_capacity(proposed.len());
 
 		for TableAttestedCandidate {
 			candidate,
@@ -290,16 +290,14 @@ impl CandidateBackingJob {
 				}
 			}
 
-			let backed = BackedCandidate {
+			tx.send(NewBackedCandidate(BackedCandidate {
 				candidate,
 				validity_votes,
 				validator_indices,
-			};
-
-			res.push(NewBackedCandidate(backed.clone()));
+			})).await?;
 		}
 
-		res
+		Ok(())
 	}
 
 	/// Check if there have happened any new misbehaviors and issue necessary messages.
@@ -376,10 +374,8 @@ impl CandidateBackingJob {
 				self.check_statement_signature(&statement)?;
 				self.maybe_validate_and_import(statement).await?;
 			}
-			CandidateBackingMessage::GetBackedCandidates(_, tx) => {
-				let backed = self.get_backed();
-
-				tx.send(backed).map_err(|_| oneshot::Canceled)?;
+			CandidateBackingMessage::RegisterBackingWatcher(_, tx) => {
+				self.get_backed(tx).await?;
 			}
 		}
 
@@ -456,7 +452,7 @@ impl CandidateBackingJob {
 	async fn request_pov_from_distribution(
 		&mut self,
 		descriptor: CandidateDescriptor,
-	) -> Result<PoVBlock, Error> {
+	) -> Result<Arc<PoVBlock>, Error> {
 		let (tx, rx) = oneshot::channel();
 
 		self.tx_from.send(FromJob::PoVDistribution(
@@ -469,7 +465,7 @@ impl CandidateBackingJob {
 	async fn request_candidate_validation(
 		&mut self,
 		candidate: AbridgedCandidateReceipt,
-		pov: PoVBlock,
+		pov: Arc<PoVBlock>,
 	) -> Result<(ValidationResult, GlobalValidationSchedule, LocalValidationData), Error> {
 		let (tx, rx) = oneshot::channel();
 
@@ -502,7 +498,7 @@ impl CandidateBackingJob {
 
 	async fn make_pov_available(
 		&mut self,
-		pov_block: PoVBlock,
+		pov_block: Arc<PoVBlock>,
 		global_validation: GlobalValidationSchedule,
 		local_validation: LocalValidationData,
 	) -> Result<(), Error> {
@@ -512,7 +508,7 @@ impl CandidateBackingJob {
 		};
 
 		let available_data = AvailableData {
-			pov_block,
+			pov_block: pov_block.as_ref().clone(),
 			omitted_validation,
 		};
 
@@ -758,7 +754,7 @@ impl<S, Context> CandidateBackingSubsystem<S, Context>
 								match msg {
 									CandidateBackingMessage::Second(hash, _, _) |
 									CandidateBackingMessage::Statement(hash, _) |
-									CandidateBackingMessage::GetBackedCandidates(hash, _) => {
+									CandidateBackingMessage::RegisterBackingWatcher(hash, _) => {
 										let res = jobs.send_msg(
 											hash.clone(),
 											ToJob::CandidateBacking(msg),
@@ -1022,9 +1018,9 @@ mod tests {
 
 			test_startup(&mut virtual_overseer, &test_state).await;
 
-			let pov_block = PoVBlock {
+			let pov_block = Arc::new(PoVBlock {
 				block_data: BlockData(vec![42, 43, 44]),
-			};
+			});
 
 			let pov_block_hash = pov_block.hash();
 			let candidate = AbridgedCandidateReceipt {
@@ -1104,9 +1100,9 @@ mod tests {
 
 			test_startup(&mut virtual_overseer, &test_state).await;
 
-			let pov_block = PoVBlock {
+			let pov_block = Arc::new(PoVBlock {
 				block_data: BlockData(vec![1, 2, 3]),
-			};
+			});
 
 			let pov_block_hash = pov_block.hash();
 
@@ -1181,17 +1177,20 @@ mod tests {
 
 			virtual_overseer.send(FromOverseer::Communication{ msg: statement }).await;
 
-			let (tx, rx) = oneshot::channel();
+			let (tx, mut rx) = mpsc::channel(0);
 
 			// The backed candidats set should be not empty at this point.
 			virtual_overseer.send(FromOverseer::Communication{
-				msg: CandidateBackingMessage::GetBackedCandidates(
+				msg: CandidateBackingMessage::RegisterBackingWatcher(
 					test_state.relay_parent,
 					tx,
 				)
 			}).await;
 
-			let backed = rx.await.unwrap();
+			let mut backed = Vec::new();
+			while let Some(item) = rx.next().await {
+				backed.push(item);
+			}
 
 			// `validity_votes` may be in any order so we can't do this in a single assert.
 			assert_eq!(backed[0].0.candidate, candidate_a);
@@ -1220,9 +1219,9 @@ mod tests {
 
 			test_startup(&mut virtual_overseer, &test_state).await;
 
-			let pov_block = PoVBlock {
+			let pov_block = Arc::new(PoVBlock {
 				block_data: BlockData(vec![1, 2, 3]),
-			};
+			});
 
 			let pov_block_hash = pov_block.hash();
 			let candidate_a = AbridgedCandidateReceipt {
@@ -1350,13 +1349,13 @@ mod tests {
 
 			test_startup(&mut virtual_overseer, &test_state).await;
 
-			let pov_block_a = PoVBlock {
+			let pov_block_a = Arc::new(PoVBlock {
 				block_data: BlockData(vec![42, 43, 44]),
-			};
+			});
 
-			let pov_block_b = PoVBlock {
+			let pov_block_b = Arc::new(PoVBlock {
 				block_data: BlockData(vec![45, 46, 47]),
-			};
+			});
 
 			let pov_block_hash_a = pov_block_a.hash();
 			let pov_block_hash_b = pov_block_b.hash();
@@ -1500,9 +1499,9 @@ mod tests {
 
 			test_startup(&mut virtual_overseer, &test_state).await;
 
-			let pov_block = PoVBlock {
+			let pov_block = Arc::new(PoVBlock {
 				block_data: BlockData(vec![42, 43, 44]),
-			};
+			});
 
 			let pov_block_hash = pov_block.hash();
 
@@ -1595,9 +1594,9 @@ mod tests {
 
 			virtual_overseer.send(FromOverseer::Communication{ msg: second }).await;
 
-			let pov_to_second = PoVBlock {
+			let pov_to_second = Arc::new(PoVBlock {
 				block_data: BlockData(vec![3, 2, 1]),
-			};
+			});
 
 			let pov_block_hash = pov_to_second.hash();
 

@@ -59,7 +59,7 @@ pub enum CandidateBackingMessage {
 	RegisterBackingWatcher(Hash, mpsc::Sender<NewBackedCandidate>),
 	/// Note that the Candidate Backing subsystem should second the given candidate in the context of the
 	/// given relay-parent (ref. by hash). This candidate must be validated.
-	Second(Hash, AbridgedCandidateReceipt),
+	Second(Hash, AbridgedCandidateReceipt, Arc<PoVBlock>),
 	/// Note a validator's statement about a particular candidate. Disagreements about validity must be escalated
 	/// to a broader check by Misbehavior Arbitration. Agreements are simply tallied until a quorum is reached.
 	Statement(Hash, SignedFullStatement),
@@ -80,7 +80,7 @@ pub enum CandidateValidationMessage {
 		Hash,
 		AbridgedCandidateReceipt,
 		HeadData,
-		PoVBlock,
+		Arc<PoVBlock>,
 		oneshot::Sender<Result<
 			(ValidationResult, GlobalValidationSchedule, LocalValidationData),
 			ValidationFailed,
@@ -146,8 +146,8 @@ pub enum BitfieldDistributionMessage {
 /// Availability store subsystem message.
 #[derive(Debug)]
 pub enum AvailabilityStoreMessage {
-	/// Query a `PoVBlock` from the AV store.
-	QueryPoV(Hash, oneshot::Sender<Option<PoVBlock>>),
+	/// Query a `Arc<PoVBlock>` from the AV store.
+	QueryPoV(Hash, oneshot::Sender<Option<Arc<PoVBlock>>>),
 
 	/// Query an `ErasureChunk` from the AV store.
 	QueryChunk(Hash, ValidatorIndex, oneshot::Sender<ErasureChunk>),
