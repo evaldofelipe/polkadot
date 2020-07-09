@@ -4464,7 +4464,6 @@ dependencies = [
  "bitvec",
  "derive_more 0.99.9",
  "futures 0.3.5",
- "futures-timer 3.0.2",
  "log 0.4.8",
  "polkadot-erasure-coding",
  "polkadot-node-primitives",
@@ -4525,6 +4524,8 @@ dependencies = [
  "async-trait",
  "derive_more 0.99.9",
  "futures 0.3.5",
+ "futures-timer 3.0.2",
+ "log 0.4.8",
  "parity-scale-codec",
  "polkadot-node-primitives",
  "polkadot-primitives",
@@ -4532,6 +4533,7 @@ dependencies = [
  "sc-keystore",
  "sc-network",
  "sp-core",
+ "streamunordered",
 ]
 
 [[package]]
