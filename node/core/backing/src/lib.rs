@@ -51,9 +51,7 @@ use polkadot_subsystem::{
 	FromOverseer, OverseerSignal, Subsystem, SubsystemContext, SpawnedSubsystem,
 	util::{
 		self,
-		request_global_validation_schedule,
 		request_head_data,
-		request_local_validation_data,
 		request_signing_context,
 		request_validator_groups,
 		request_validators,
@@ -75,7 +73,6 @@ use statement_table::{
 #[derive(Debug, derive_more::From)]
 enum Error {
 	CandidateNotFound,
-	LocalValidationDataMissing,
 	JobNotFound(Hash),
 	InvalidSignature,
 	#[from]
@@ -103,13 +100,9 @@ struct CandidateBackingJob {
 
 	/// `HeadData`s of the parachains that this validator is assigned to.
 	head_data: HeadData,
-	/// Global validation schedule.
-	global_validation_schedule: GlobalValidationSchedule,
-	/// Local validation data of the parachain this validator is assigned to.
-	local_validation_data: LocalValidationData,
 	/// The `ParaId`s assigned to this validator.
 	assignment: ParaId,
-	/// We issued `Valid` statements on about these candidates.
+	/// We issued `Valid` or `Invalid` statements on about these candidates.
 	issued_validity: HashSet<Hash>,
 	/// `Some(h)` if this job has already issues `Seconded` statemt for some candidate with `h` hash.
 	seconded: Option<Hash>,
@@ -126,10 +119,10 @@ const fn group_quorum(n_validators: usize) -> usize {
 
 #[derive(Default)]
 struct TableContext {
-	groups: HashMap<ParaId, Vec<ValidatorIndex>>,
-	validator: Option<Validator>,
-	validators: Vec<ValidatorId>,
 	signing_context: SigningContext,
+	validator: Option<Validator>,
+	groups: HashMap<ParaId, Vec<ValidatorIndex>>,
+	validators: Vec<ValidatorId>,
 }
 
 impl TableContextTrait for TableContext {
@@ -242,13 +235,13 @@ impl CandidateBackingJob {
 		candidate: AbridgedCandidateReceipt,
 		pov: PoVBlock,
 	) -> Result<ValidationResult, Error> {
-		let valid = self.request_candidate_validation(candidate.clone(), pov.clone()).await?;
+		let (valid, global_validation_schedule, local_validation_data) = self.request_candidate_validation(candidate.clone(), pov.clone()).await?;
 		let statement = match valid {
 			ValidationResult::Valid => {
 				// make PoV available for later distribution. Send data to the availability
 				// store to keep. Sign and dispatch `valid` statement to network if we
 				// have not seconded the given candidate.
-				self.make_pov_available(pov).await?;
+				self.make_pov_available(pov, global_validation_schedule, local_validation_data).await?;
 				self.issued_validity.insert(candidate.hash());
 				Statement::Seconded(candidate)
 			}
@@ -403,21 +396,20 @@ impl CandidateBackingJob {
 		let descriptor = candidate.to_descriptor();
 		let candidate_hash = candidate.hash();
 		let pov = self.request_pov_from_distribution(descriptor).await?;
-		let v = self.request_candidate_validation(candidate, pov).await?;
+		let (valid, _, _) = self.request_candidate_validation(candidate, pov).await?;
 
-		let statement = match v {
-			ValidationResult::Valid => {
-				self.issued_validity.insert(candidate_hash);
-				Statement::Valid(candidate_hash)
-			}
+		let statement = match valid {
+			ValidationResult::Valid => Statement::Valid(candidate_hash),
 			ValidationResult::Invalid => Statement::Invalid(candidate_hash),
 		};
+
+		self.issued_validity.insert(candidate_hash);
 
 		if let Some(signed_statement) = self.sign_statement(statement) {
 			self.distribute_signed_statement(signed_statement).await?;
 		}
 
-		Ok(v)
+		Ok(valid)
 	}
 
 	/// Import the statement and kick off validation work if it is a part of our assignment.
@@ -444,12 +436,10 @@ impl CandidateBackingJob {
 		let idx = statement.validator_index() as usize;
 
 		if self.table_context.validators.len() > idx {
-			statement
-				.check_signature(
-					&self.table_context.signing_context,
-					&self.table_context.validators[idx],
-				)
-				.map_err(|_| Error::InvalidSignature)?;
+			statement.check_signature(
+				&self.table_context.signing_context,
+				&self.table_context.validators[idx],
+			).map_err(|_| Error::InvalidSignature)?;
 		} else {
 			return Err(Error::InvalidSignature);
 		}
@@ -480,7 +470,7 @@ impl CandidateBackingJob {
 		&mut self,
 		candidate: AbridgedCandidateReceipt,
 		pov: PoVBlock,
-	) -> Result<ValidationResult, Error> {
+	) -> Result<(ValidationResult, GlobalValidationSchedule, LocalValidationData), Error> {
 		let (tx, rx) = oneshot::channel();
 
 		self.tx_from.send(FromJob::CandidateValidation(
@@ -513,10 +503,12 @@ impl CandidateBackingJob {
 	async fn make_pov_available(
 		&mut self,
 		pov_block: PoVBlock,
+		global_validation: GlobalValidationSchedule,
+		local_validation: LocalValidationData,
 	) -> Result<(), Error> {
 		let omitted_validation = OmittedValidationData {
-			global_validation: self.global_validation_schedule.clone(),
-			local_validation: self.local_validation_data.clone(),
+			global_validation,
+			local_validation,
 		};
 
 		let available_data = AvailableData {
@@ -602,7 +594,10 @@ async fn run_job(
 
 	for assignment in roster.scheduled {
 		if let Some(g) = roster.validator_groups.get(assignment.group_idx.0 as usize) {
-			groups.insert(assignment.para_id, g.clone());
+			groups.insert(
+				assignment.para_id,
+				g.clone(),
+			);
 		}
 	}
 
@@ -618,13 +613,7 @@ async fn run_job(
 		}
 	}
 
-	let (head_data, local_validation_data, global_validation_schedule) = futures::try_join!(
-		request_head_data(parent, &mut tx_from, assignment).await?,
-		request_local_validation_data(parent, assignment, &mut tx_from).await?,
-		request_global_validation_schedule(parent, &mut tx_from).await?,
-	)?;
-
-	let local_validation_data = local_validation_data.ok_or(Error::LocalValidationDataMissing)?;
+	let head_data = request_head_data(parent, &mut tx_from, assignment).await?.await?;
 
 	let table_context = TableContext {
 		groups,
@@ -638,8 +627,6 @@ async fn run_job(
 		rx_to,
 		tx_from,
 		head_data,
-		global_validation_schedule,
-		local_validation_data,
 		assignment,
 		issued_validity: HashSet::new(),
 		seconded: None,
@@ -1023,29 +1010,6 @@ mod tests {
 				tx.send(test_state.signing_context.clone()).unwrap();
 			}
 		);
-
-		// Check that subsystem job requests a local validation data for assignment.
-		assert_matches!(
-			virtual_overseer.recv().await,
-			AllMessages::RuntimeApi(
-				RuntimeApiMessage::Request(parent, RuntimeApiRequest::LocalValidationData(_id, tx))
-			) if parent == test_state.relay_parent => {
-				tx.send(Some(test_state.local_validation_data.clone())).unwrap();
-			}
-		);
-
-		// Check that subsystem job requests a global validation schedule for assignment.
-		assert_matches!(
-			virtual_overseer.recv().await,
-			AllMessages::RuntimeApi(
-				RuntimeApiMessage::Request(
-					parent,
-					RuntimeApiRequest::GlobalValidationSchedule(tx),
-				)
-			) if parent == test_state.relay_parent => {
-				tx.send(test_state.global_validation_schedule.clone()).unwrap();
-			}
-		);
 	}
 
 	// Test that a `CandidateBackingMessage::Second` issues validation work
@@ -1093,7 +1057,11 @@ mod tests {
 				) if parent_hash == test_state.relay_parent &&
 					pov == pov_block && c == candidate => {
 					assert_eq!(head_data, *expected_head_data);
-					tx.send(Ok(ValidationResult::Valid)).unwrap();
+					tx.send(Ok((
+						ValidationResult::Valid,
+						test_state.global_validation_schedule,
+						test_state.local_validation_data,
+					))).unwrap();
 				}
 			);
 
@@ -1198,7 +1166,11 @@ mod tests {
 				) if relay_parent == test_state.relay_parent && candidate == candidate_a => {
 					assert_eq!(head_data, *expected_head_data);
 					assert_eq!(pov, pov_block);
-					tx.send(Ok(ValidationResult::Valid)).unwrap();
+					tx.send(Ok((
+						ValidationResult::Valid,
+						test_state.global_validation_schedule,
+						test_state.local_validation_data,
+					))).unwrap();
 				}
 			);
 
@@ -1311,7 +1283,11 @@ mod tests {
 				) if relay_parent == test_state.relay_parent && candidate == candidate_a => {
 					assert_eq!(pov, pov_block);
 					assert_eq!(head_data, *expected_head_data);
-					tx.send(Ok(ValidationResult::Valid)).unwrap();
+					tx.send(Ok((
+						ValidationResult::Valid,
+						test_state.global_validation_schedule,
+						test_state.local_validation_data,
+					))).unwrap();
 				}
 			);
 
@@ -1424,7 +1400,11 @@ mod tests {
 				) if parent_hash == test_state.relay_parent &&
 					pov == pov_block_a && c == candidate_a => {
 					assert_eq!(head_data, *expected_head_data);
-					tx.send(Ok(ValidationResult::Invalid)).unwrap();
+					tx.send(Ok((
+						ValidationResult::Invalid,
+						test_state.global_validation_schedule.clone(),
+						test_state.local_validation_data.clone(),
+					))).unwrap();
 				}
 			);
 
@@ -1470,7 +1450,11 @@ mod tests {
 				) if parent_hash == test_state.relay_parent &&
 					pov == pov_block_b && c == candidate_b => {
 					assert_eq!(head_data, *expected_head_data);
-					tx.send(Ok(ValidationResult::Valid)).unwrap();
+					tx.send(Ok((
+						ValidationResult::Valid,
+						test_state.global_validation_schedule,
+						test_state.local_validation_data,
+					))).unwrap();
 				}
 			);
 

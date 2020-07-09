@@ -79,7 +79,10 @@ pub enum CandidateValidationMessage {
 		AbridgedCandidateReceipt,
 		HeadData,
 		PoVBlock,
-		oneshot::Sender<Result<ValidationResult, ValidationFailed>>,
+		oneshot::Sender<Result<
+			(ValidationResult, GlobalValidationSchedule, LocalValidationData),
+			ValidationFailed,
+		>>,
 	),
 }
 
@@ -179,10 +182,10 @@ pub enum RuntimeApiRequest {
 	ValidationCode(ParaId, BlockNumber, Option<BlockNumber>, oneshot::Sender<ValidationCode>),
 	/// Get head data for a specific para.
 	HeadData(ParaId, oneshot::Sender<HeadData>),
-	/// Get the local validation data.
-	LocalValidationData(ParaId, oneshot::Sender<Option<LocalValidationData>>),
-	/// Get the global validation schedule.
+	/// Get the global validation schedule
 	GlobalValidationSchedule(oneshot::Sender<GlobalValidationSchedule>),
+	/// Get a parachain's local validation data
+	LocalValidationData(ParaId, oneshot::Sender<Option<LocalValidationData>>),
 }
 
 /// A message to the Runtime API subsystem.
