@@ -34,12 +34,11 @@ use futures::{
 use futures_timer::Delay;
 use streamunordered::{StreamUnordered, StreamYield};
 
-use primitives::Pair;
 use keystore::KeyStorePtr;
 use polkadot_primitives::{
 	Hash,
 	parachain::{
-		AbridgedCandidateReceipt, BackedCandidate, Id as ParaId, ValidatorPair, ValidatorId,
+		AbridgedCandidateReceipt, BackedCandidate, Id as ParaId, ValidatorId,
 		ValidatorIndex, HeadData, SigningContext, PoVBlock, OmittedValidationData,
 		CandidateDescriptor, LocalValidationData, GlobalValidationSchedule, AvailableData,
 		ErasureChunk,
@@ -58,6 +57,7 @@ use polkadot_subsystem::{
 		request_signing_context,
 		request_validator_groups,
 		request_validators,
+		Validator,
 	},
 };
 use polkadot_subsystem::messages::{
@@ -74,7 +74,6 @@ use statement_table::{
 
 #[derive(Debug, derive_more::From)]
 enum Error {
-	NotInValidatorSet,
 	CandidateNotFound,
 	LocalValidationDataMissing,
 	JobNotFound(Hash),
@@ -127,10 +126,10 @@ const fn group_quorum(n_validators: usize) -> usize {
 
 #[derive(Default)]
 struct TableContext {
-	signing_context: SigningContext,
-	key: Option<ValidatorPair>,
 	groups: HashMap<ParaId, Vec<ValidatorIndex>>,
+	validator: Option<Validator>,
 	validators: Vec<ValidatorId>,
+	signing_context: SigningContext,
 }
 
 impl TableContextTrait for TableContext {
@@ -140,22 +139,6 @@ impl TableContextTrait for TableContext {
 
 	fn requisite_votes(&self, group: &ParaId) -> usize {
 		self.groups.get(group).map_or(usize::max_value(), |g| group_quorum(g.len()))
-	}
-}
-
-impl TableContext {
-	fn local_id(&self) -> Option<ValidatorId> {
-		self.key.as_ref().map(|k| k.public())
-	}
-
-	fn local_index(&self) -> Option<ValidatorIndex> {
-		self.local_id().and_then(|id|
-			self.validators
-				.iter()
-				.enumerate()
-				.find(|(_, k)| k == &&id)
-				.map(|(i, _)| i as ValidatorIndex)
-		)
 	}
 }
 
@@ -227,16 +210,6 @@ fn primitive_statement_to_table(s: &SignedFullStatement) -> TableSignedStatement
 	}
 }
 
-// finds the first key we are capable of signing with out of the given set of validators,
-// if any.
-fn signing_key(validators: &[ValidatorId], keystore: &KeyStorePtr) -> Option<ValidatorPair> {
-	let keystore = keystore.read();
-	validators.iter()
-		.find_map(|v| {
-			keystore.key_pair::<ValidatorPair>(&v).ok()
-		})
-}
-
 impl CandidateBackingJob {
 	/// Run asynchronously.
 	async fn run(mut self) -> Result<(), Error> {
@@ -298,9 +271,12 @@ impl CandidateBackingJob {
 		let proposed = self.table.proposed_candidates(&self.table_context);
 		let mut res = Vec::with_capacity(proposed.len());
 
-		for p in proposed.into_iter() {
-			let TableAttestedCandidate { candidate, validity_votes, .. } = p;
-
+		for TableAttestedCandidate {
+			candidate,
+			validity_votes,
+			..
+		} in proposed.into_iter()
+		{
 			let (ids, validity_votes): (Vec<_>, Vec<_>) = validity_votes
 						.into_iter()
 						.map(|(id, vote)| (id, vote.into()))
@@ -311,9 +287,7 @@ impl CandidateBackingJob {
 				None => continue,
 			};
 
-			let mut validator_indices = BitVec::with_capacity(
-				group.len()
-			);
+			let mut validator_indices = BitVec::with_capacity(group.len());
 
 			validator_indices.resize(group.len(), false);
 
@@ -463,28 +437,19 @@ impl CandidateBackingJob {
 	}
 
 	fn sign_statement(&self, statement: Statement) -> Option<SignedFullStatement> {
-		let local_index = self.table_context.local_index()?;
-
-		let signing_key = self.table_context.key.as_ref()?;
-
-		let signed_statement = SignedFullStatement::sign(
-			statement,
-			&self.table_context.signing_context,
-			local_index,
-			signing_key,
-		);
-
-		Some(signed_statement)
+		Some(self.table_context.validator.as_ref()?.sign(statement))
 	}
 
 	fn check_statement_signature(&self, statement: &SignedFullStatement) -> Result<(), Error> {
 		let idx = statement.validator_index() as usize;
 
 		if self.table_context.validators.len() > idx {
-			statement.check_signature(
-				&self.table_context.signing_context,
-				&self.table_context.validators[idx],
-			).map_err(|_| Error::InvalidSignature)?;
+			statement
+				.check_signature(
+					&self.table_context.signing_context,
+					&self.table_context.validators[idx],
+				)
+				.map_err(|_| Error::InvalidSignature)?;
 		} else {
 			return Err(Error::InvalidSignature);
 		}
@@ -601,11 +566,10 @@ impl JobHandle {
 		let stop_timer = Delay::new(Duration::from_secs(1));
 
 		match future::select(stop_timer, self.finished).await {
-			Either::Left((_, _)) => {
-			},
+			Either::Left((_, _)) => {}
 			Either::Right((_, _)) => {
 				self.abort_handle.abort();
-			},
+			}
 		}
 	}
 
@@ -626,26 +590,25 @@ async fn run_job(
 	rx_to: mpsc::Receiver<ToJob>,
 	mut tx_from: mpsc::Sender<FromJob>,
 ) -> Result<(), Error> {
-	let (validators, roster) = futures::try_join!(
+	let (validators, roster, signing_context) = futures::try_join!(
 		request_validators(parent, &mut tx_from).await?,
 		request_validator_groups(parent, &mut tx_from).await?,
+		request_signing_context(parent, &mut tx_from).await?,
 	)?;
 
-	let key = signing_key(&validators[..], &keystore).ok_or(Error::NotInValidatorSet)?;
+	let validator = Validator::construct(&validators, signing_context, keystore.clone())?;
+
 	let mut groups = HashMap::new();
 
 	for assignment in roster.scheduled {
 		if let Some(g) = roster.validator_groups.get(assignment.group_idx.0 as usize) {
-			groups.insert(
-				assignment.para_id,
-				g.clone(),
-			);
+			groups.insert(assignment.para_id, g.clone());
 		}
 	}
 
 	let mut assignment = Default::default();
 
-	if let Some(idx) = validators.iter().position(|k| *k == key.public()) {
+	if let Some(idx) = validators.iter().position(|k| *k == validator.id()) {
 		let idx = idx as u32;
 		for (para_id, group) in groups.iter() {
 			if group.contains(&idx) {
@@ -655,14 +618,8 @@ async fn run_job(
 		}
 	}
 
-	let (
-		head_data,
-		signing_context,
-		local_validation_data,
-		global_validation_schedule,
-	) = futures::try_join!(
+	let (head_data, local_validation_data, global_validation_schedule) = futures::try_join!(
 		request_head_data(parent, &mut tx_from, assignment).await?,
-		request_signing_context(parent, &mut tx_from).await?,
 		request_local_validation_data(parent, assignment, &mut tx_from).await?,
 		request_global_validation_schedule(parent, &mut tx_from).await?,
 	)?;
@@ -670,10 +627,10 @@ async fn run_job(
 	let local_validation_data = local_validation_data.ok_or(Error::LocalValidationDataMissing)?;
 
 	let table_context = TableContext {
-		signing_context,
-		key: Some(key),
 		groups,
 		validators,
+		signing_context: validator.signing_context().clone(),
+		validator: Some(validator),
 	};
 
 	let job = CandidateBackingJob {
@@ -869,13 +826,18 @@ impl<S, Context> Subsystem<Context> for CandidateBackingSubsystem<S, Context>
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use futures::{Future, executor::{self, ThreadPool}};
-	use std::collections::HashMap;
-	use sp_keyring::Sr25519Keyring;
-	use polkadot_primitives::parachain::{
-		AssignmentKind, CollatorId, CoreAssignment, BlockData, CoreIndex, GroupIndex, ValidityAttestation,
-	};
 	use assert_matches::assert_matches;
+	use futures::{
+		executor::{self, ThreadPool},
+		Future,
+	};
+	use polkadot_primitives::parachain::{
+		AssignmentKind, BlockData, CollatorId, CoreAssignment, CoreIndex, GroupIndex,
+		ValidatorPair, ValidityAttestation,
+	};
+	use polkadot_subsystem::messages::{RuntimeApiRequest, SchedulerRoster};
+	use sp_keyring::Sr25519Keyring;
+	use std::collections::HashMap;
 
 	fn validator_pubkeys(val_ids: &[Sr25519Keyring]) -> Vec<ValidatorId> {
 		val_ids.iter().map(|v| v.public().into()).collect()
@@ -1399,7 +1361,6 @@ mod tests {
 					).unwrap();
 				}
 			);
-
 		});
 	}
 
