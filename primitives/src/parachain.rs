@@ -343,7 +343,7 @@ fn check_collator_signature<H: AsRef<[u8]>>(
 	pov_block_hash: &H,
 	collator: &CollatorId,
 	signature: &CollatorSignature,
-) -> Result<(),()> {
+) -> Result<(), ()> {
 	let payload = collator_signature_payload(relay_parent, parachain_index, pov_block_hash);
 	if signature.verify(&payload[..], collator) {
 		Ok(())
@@ -476,50 +476,13 @@ pub struct AbridgedCandidateReceipt<H = Hash> {
 	pub commitments: CandidateCommitments<H>,
 }
 
-/// A unique descriptor of the candidate receipt.
-#[cfg_attr(feature = "std", derive(Debug, Default))]
-pub struct CandidateDescriptor<H = Hash> {
-	/// The ID of the parachain this is a candidate for.
-	pub parachain_index: Id,
-	/// The hash of the relay-chain block this should be executed in
-	/// the context of.
-	pub relay_parent: H,
-	/// The collator's relay-chain account ID
-	pub collator: CollatorId,
-	/// Signature on blake2-256 of the block data by collator.
-	pub signature: CollatorSignature,
-	/// Hash of the PoVBlock.
-	pub pov_block_hash: H,
-}
-
-impl<H> From<AbridgedCandidateReceipt<H>> for CandidateDescriptor<H> {
-	fn from(a: AbridgedCandidateReceipt<H>) -> Self {
-		let AbridgedCandidateReceipt {
-			parachain_index,
-			relay_parent,
-			collator,
-			signature,
-			pov_block_hash,
-			..
-		} = a;
-
-		Self {
-			parachain_index,
-			relay_parent,
-			collator,
-			signature,
-			pov_block_hash,
-		}
-	}
-}
-
 /// A candidate-receipt with commitments directly included.
 pub struct CommitedCandidateReceipt<H = Hash> {
 	/// The descriptor of the candidae.
 	pub descriptor: CandidateDescriptor,
 
 	/// The commitments of the candidate receipt.
-	pub commitments: CandidateCommitments<H>
+	pub commitments: CandidateCommitments<H>,
 }
 
 impl<H: AsRef<[u8]> + Encode> AbridgedCandidateReceipt<H> {
@@ -601,15 +564,14 @@ impl AbridgedCandidateReceipt {
 		}
 	}
 
-		
 	/// Clone the relevant portions of the `AbridgedCandidateReceipt` to form a `CandidateDescriptor`.
 	pub fn to_descriptor(&self) -> CandidateDescriptor {
 		CandidateDescriptor {
-			parachain_index: self.parachain_index,
+			para_id: self.parachain_index,
 			relay_parent: self.relay_parent,
 			collator: self.collator.clone(),
 			signature: self.signature.clone(),
-			pov_block_hash: self.pov_block_hash.clone(),
+			pov_hash: self.pov_block_hash.clone(),
 		}
 	}
 }
@@ -626,6 +588,47 @@ impl Ord for AbridgedCandidateReceipt {
 		// https://github.com/paritytech/polkadot/issues/222
 		self.parachain_index.cmp(&other.parachain_index)
 			.then_with(|| self.head_data.cmp(&other.head_data))
+	}
+}
+
+/// A unique descriptor of the candidate receipt, in a lightweight format.
+#[derive(PartialEq, Eq, Clone, Encode, Decode)]
+#[cfg_attr(feature = "std", derive(Debug, Default))]
+pub struct CandidateDescriptor<H = Hash> {
+	/// The ID of the para this is a candidate for.
+	pub para_id: Id,
+	/// The hash of the relay-chain block this should be executed in
+	/// the context of.
+	// NOTE: the fact that the hash includes this value means that code depends
+	// on this for deduplication. Removing this field is likely to break things.
+	pub relay_parent: H,
+	/// The collator's relay-chain account ID
+	pub collator: CollatorId,
+	/// Signature on blake2-256 of components of this receipt:
+	/// The para ID, the relay parent, and the pov_hash.
+	pub signature: CollatorSignature,
+	/// The hash of the pov-block.
+	pub pov_hash: H,
+}
+
+impl<H> From<AbridgedCandidateReceipt<H>> for CandidateDescriptor<H> {
+	fn from(
+		AbridgedCandidateReceipt {
+			parachain_index,
+			relay_parent,
+			collator,
+			signature,
+			pov_block_hash,
+			..
+		}: AbridgedCandidateReceipt<H>,
+	) -> Self {
+		Self {
+			para_id: parachain_index,
+			relay_parent,
+			collator,
+			signature,
+			pov_hash: pov_block_hash,
+		}
 	}
 }
 
@@ -920,11 +923,11 @@ pub fn check_candidate_backing<H: AsRef<[u8]> + Encode>(
 	validator_lookup: impl Fn(usize) -> Option<ValidatorId>,
 ) -> Result<usize, ()> {
 	if backed.validator_indices.len() != group_len {
-		return Err(())
+		return Err(());
 	}
 
 	if backed.validity_votes.len() > group_len {
-		return Err(())
+		return Err(());
 	}
 
 	// this is known, even in runtime, to be blake2-256.
@@ -942,12 +945,12 @@ pub fn check_candidate_backing<H: AsRef<[u8]> + Encode>(
 		if sig.verify(&payload[..], &validator_id) {
 			signed += 1;
 		} else {
-			return Err(())
+			return Err(());
 		}
 	}
 
 	if signed != backed.validity_votes.len() {
-		return Err(())
+		return Err(());
 	}
 
 	Ok(signed)

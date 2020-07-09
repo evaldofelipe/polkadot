@@ -35,6 +35,8 @@ use polkadot_node_primitives::{
 	MisbehaviorReport, SignedFullStatement, View, ProtocolId, ValidationResult,
 };
 
+use std::sync::Arc;
+
 pub use sc_network::{ObservedRole, ReputationChange, PeerId};
 
 /// A notification of a new backed candidate.
@@ -52,12 +54,12 @@ pub enum CandidateSelectionMessage {
 /// Messages received by the Candidate Backing subsystem.
 #[derive(Debug)]
 pub enum CandidateBackingMessage {
-	/// Requests a set of backable candidates that could be backed in a child of the given
-	/// relay-parent, referenced by its hash.
-	GetBackedCandidates(Hash, oneshot::Sender<Vec<NewBackedCandidate>>),
+	/// Registers a stream listener for updates to the set of backable candidates that could be backed
+	/// in a child of the given relay-parent, referenced by its hash.
+	RegisterBackingWatcher(Hash, mpsc::Sender<NewBackedCandidate>),
 	/// Note that the Candidate Backing subsystem should second the given candidate in the context of the
 	/// given relay-parent (ref. by hash). This candidate must be validated.
-	Second(Hash, AbridgedCandidateReceipt, PoVBlock),
+	Second(Hash, AbridgedCandidateReceipt),
 	/// Note a validator's statement about a particular candidate. Disagreements about validity must be escalated
 	/// to a broader check by Misbehavior Arbitration. Agreements are simply tallied until a quorum is reached.
 	Statement(Hash, SignedFullStatement),
@@ -241,20 +243,19 @@ pub enum ProvisionerMessage {
 	ProvisionableData(ProvisionableData),
 }
 
-/// Message to the PoVDistributionMessage.
+/// Message to the PoV Distribution Subsystem.
 #[derive(Debug)]
 pub enum PoVDistributionMessage {
-	/// Note a statement by a validator on a relay-parent. `Seconded` statements must always
-	/// have been passed in before `Valid` or `Invalid` statements.
-	ValidatorStatement(Hash, SignedFullStatement),
 	/// Fetch a PoV from the network.
-	/// (relay_parent, PoV-hash, Response channel).
-	FetchPoV(Hash, CandidateDescriptor, oneshot::Sender<PoVBlock>),
-	/// Distribute a PoV for the given relay-parent and CandidateDescriptor.
-	/// The PoV should correctly hash to the PoV hash mentioned in the CandidateDescriptor
-	DistributePoV(Hash, CandidateDescriptor, PoVBlock),
-	/// An update from the network bridge.
-	NetworkBridgeUpdate(NetworkBridgeEvent),
+	///
+	/// This `CandidateDescriptor` should correspond to a candidate seconded under the provided
+	/// relay-parent hash.
+    FetchPoV(Hash, CandidateDescriptor, oneshot::Sender<Arc<PoVBlock>>),
+    /// Distribute a PoV for the given relay-parent and CandidateDescriptor.
+    /// The PoV should correctly hash to the PoV hash mentioned in the CandidateDescriptor
+    DistributePoV(Hash, CandidateDescriptor, Arc<PoVBlock>),
+    /// An update from the network bridge.
+    NetworkBridgeUpdate(NetworkBridgeEvent),
 }
 
 /// A message type tying together all message types that are used across Subsystems.
@@ -274,12 +275,12 @@ pub enum AllMessages {
 	BitfieldDistribution(BitfieldDistributionMessage),
 	/// Message for the Provisioner subsystem.
 	Provisioner(ProvisionerMessage),
+	/// Message for the PoV Distribution subsystem.
+	PoVDistribution(PoVDistributionMessage),
 	/// Message for the Runtime API subsystem.
 	RuntimeApi(RuntimeApiMessage),
 	/// Message for the availability store subsystem.
 	AvailabilityStore(AvailabilityStoreMessage),
-	/// Message for the PoV distribution subsystem.
-	PoVDistribution(PoVDistributionMessage),
 	/// Message for the network bridge subsystem.
 	NetworkBridge(NetworkBridgeMessage),
 }
